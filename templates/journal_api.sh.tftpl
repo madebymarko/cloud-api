@@ -1,0 +1,129 @@
+#!/bin/bash
+# Runs once, as root, on first boot. Log: /var/log/user-data.log
+set -euo pipefail
+exec > >(tee -a /var/log/user-data.log) 2>&1
+echo "=== user-data start: $(date -Is) ==="
+
+export DEBIAN_FRONTEND=noninteractive
+APT="apt-get -y -o DPkg::Lock::Timeout=300 -o Acquire::Retries=5"
+
+APP_DIR=/opt/journal-api
+APP_USER=journal
+APP_DB_USER=journal_app
+CONF_DIR=/etc/journal-api
+
+# 1) OS packages
+$APT update
+$APT install git curl openssl postgresql-client python3-boto3 netcat-openbsd
+
+# 2) uv: installs Python 3.14 and the locked dependencies
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+
+# 3) Unprivileged user that runs the app (no shell, no home)
+id "$APP_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$APP_USER"
+id "$APP_USER" >/dev/null 2>&1 || useradd --system --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$APP_USER"
+
+# 4) Code at a pinned git ref (owned by root, read-only for the app)
+git clone --quiet "${app_repo_url}" "$APP_DIR"
+git -C "$APP_DIR" checkout --quiet "${app_git_ref}"
+
+# 5) Python 3.14 + dependencies exactly as in uv.lock (no dev tools)
+export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+export UV_CACHE_DIR=/var/cache/uv
+cd "$APP_DIR"
+uv sync --frozen --no-dev --python 3.14
+
+# 5b) AWS RDS certificate authority bundle, so clients can verify the DB's identity
+install -d -m 0755 /etc/ssl/rds
+curl -fsSL -o /etc/ssl/rds/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+chmod 0644 /etc/ssl/rds/global-bundle.pem
+
+# 6) Master DB credentials from Secrets Manager (used only for setup below)
+{ read -r MASTER_USER; read -r MASTER_PW; } < <(python3 - <<'PY'
+import json
+import boto3
+client = boto3.client("secretsmanager", region_name="${aws_region}")
+creds = json.loads(client.get_secret_value(SecretId="${db_secret_arn}")["SecretString"])
+print(creds["username"])
+print(creds["password"])
+PY
+)
+export PGHOST="${db_host}" PGPORT=5432 PGDATABASE="${db_name}" PGSSLMODE=verify-full PGSSLROOTCERT=/etc/ssl/rds/global-bundle.pem
+export PGUSER="$MASTER_USER" PGPASSWORD="$MASTER_PW"
+
+# 7) Schema from your repo (idempotent: CREATE ... IF NOT EXISTS)
+psql -v ON_ERROR_STOP=1 -f "$APP_DIR/database_setup.sql"
+
+# 8) Least-privilege DB user for the app: data access only, no DDL, not the master user
+APP_DB_PW=$(openssl rand -hex 24)
+psql -v ON_ERROR_STOP=1 -v app_user="$APP_DB_USER" -v app_pw="$APP_DB_PW" -v db="${db_name}" <<'SQL'
+SELECT format('CREATE ROLE %I LOGIN', :'app_user')
+WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'app_user') \gexec
+ALTER ROLE :"app_user" WITH LOGIN PASSWORD :'app_pw';
+GRANT CONNECT ON DATABASE :"db" TO :"app_user";
+GRANT USAGE ON SCHEMA public TO :"app_user";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO :"app_user";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"app_user";
+SQL
+unset PGUSER PGPASSWORD MASTER_USER MASTER_PW
+
+# 9) App configuration: root-only file, read by systemd at start
+OPENAI_API_KEY=$(python3 - <<'PY'
+import boto3
+ssm = boto3.client("ssm", region_name="${aws_region}")
+print(ssm.get_parameter(Name="${openai_api_key_param}", WithDecryption=True)["Parameter"]["Value"])
+PY
+)
+install -d -m 0750 "$CONF_DIR"
+(
+  umask 077
+  cat > "$CONF_DIR/journal-api.env" <<EOF
+DATABASE_URL=postgresql://$APP_DB_USER:$APP_DB_PW@${db_host}:5432/${db_name}?sslmode=verify-full&sslrootcert=/etc/ssl/rds/global-bundle.pem
+OPENAI_API_KEY=$OPENAI_API_KEY
+OPENAI_BASE_URL=${openai_base_url}
+OPENAI_MODEL=${openai_model}
+PYTHONDONTWRITEBYTECODE=1
+EOF
+)
+unset APP_DB_PW OPENAI_API_KEY
+
+# 10) systemd service: starts now, on every boot, and again after any crash
+cat > /etc/systemd/system/journal-api.service <<'EOF'
+[Unit]
+Description=Journal API (FastAPI + Uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=journal
+Group=journal
+Environment=HOME=/nonexistent
+WorkingDirectory=/opt/journal-api
+EnvironmentFile=/etc/journal-api/journal-api.env
+ExecStart=/opt/journal-api/.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port ${app_port} --proxy-headers --forwarded-allow-ips=*
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now journal-api
+
+# 11) Smoke test (logged only; never fails the boot)
+for attempt in $(seq 1 30); do
+  if curl -sf "http://127.0.0.1:${app_port}/entries" >/dev/null; then
+    echo "Smoke test passed: /entries responded"
+    break
+  fi
+  sleep 2
+done
+
+echo "=== user-data done: $(date -Is) ==="
